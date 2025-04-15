@@ -1,12 +1,31 @@
 {
-  "name": "foundry-mcp-server",
+  "name": "foundry-mcp",
+  "version": "1.0.0",
+  "description": "A simple, lightweight and fast MCP (Model Context Protocol) server for Foundry (Solidity/EVM).",
   "module": "src/index.ts",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "foundry-mcp": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js"
   },
+  "author": "Alex Bakers <alex.baker.fon@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexbakers/foundry-mcp.git"
+  },
+  "keywords": [
+    "foundry",
+    "mcp",
+    "solidity",
+    "evm",
+    "blockchain",
+    "server"
+  ],
   "devDependencies": {
     "@types/bun": "latest"
   },

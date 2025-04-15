@@ -49,16 +49,8 @@ This server connects LLM assistants to the Foundry ecosystem, enabling them to:
 - Get event logs
 - Lookup function and event signatures
 
-## Usage
+## Installation & Usage
 
-The server is designed to be used as an MCP tool provider for MCP Clients. When connected to a client, it enables the clients(claude desktop, cursor, client, etc.,) to perform Solidity and onchain operations directly.
-
-
-#### Requirements
-
-- [Node.js v18+](https://nodejs.org)
-- [Foundry toolchain](https://book.getfoundry.sh/) (Forge, Cast, Anvil)
-  
 ### Manual Setup
 
 1. Ensure Foundry tools (Forge, Cast, Anvil) are installed on your system:
@@ -77,12 +69,10 @@ The server is designed to be used as an MCP tool provider for MCP Clients. When 
 ```json
  "mcpServers": {
     "foundry": {
-      "command": "node",
-      "args": [
-        "path/to/foundry-mcp-server/dist/index.js"
-      ],
+      "command": "npx",
+      "args": ["-y", "foundry-mcp"],
       "env" :{
-        "PRIVATE_KEY": "0x1234",
+        "PRIVATE_KEY": "0x1234"
       }
     }
  }
@@ -91,11 +81,86 @@ The server is designed to be used as an MCP tool provider for MCP Clients. When 
 > [!NOTE]
 > `PRIVATE_KEY` is optional 
 
+### NPM Package
 
-### Setup using NPM Package
-- Coming soon  
+You can install the server as an NPM package (after it is published):
 
-#### Configuration
+```sh
+npm install foundry-mcp
+```
+
+Or run directly with npx:
+
+```sh
+npx -y foundry-mcp
+```
+
+### Docker Image
+
+You can pull and run the official Docker image (after it is published):
+
+```sh
+docker pull alexbakers/foundry-mcp:latest
+docker run -p 3000:3000 alexbakers/foundry-mcp:latest
+```
+
+Or use in your mcpServers config:
+
+```json
+ "mcpServers": {
+    "foundry": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "/path/to/your/project:/path/to/your/project",
+        "-e",
+        "PRIVATE_KEY",
+        "alexbakers/foundry-mcp"
+      ],
+      "env" :{
+        "PRIVATE_KEY": "0x1234"
+      }
+    }
+ }
+```
+
+## Development & Publishing
+
+### Build Locally
+
+```sh
+npm install
+npm run build
+```
+
+### Publish to NPM & Docker Hub
+
+Publishing is automated via GitHub Actions on every release tag (`vX.Y.Z`).
+
+- **NPM:** Requires `NPM_TOKEN` secret in GitHub.
+- **Docker:** Requires `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets in GitHub.
+
+---
+
+## mcpServers Usage
+
+To use the server in your mcpServers setup, either:
+
+- Install from NPM:
+  ```sh
+  npm install foundry-mcp
+  ```
+- Or use the Docker image:
+  ```sh
+  docker pull alexbakers/foundry-mcp:latest
+  ```
+
+---
+
+## Configuration
 
 The server supports the following environment variables:
 
@@ -149,7 +214,7 @@ The server maintains a persistent Forge workspace at `~/.mcp-foundry-workspace` 
 - `contract_size`: Get the bytecode size of a deployed contract
 - `estimate_gas`: Estimate the gas cost of a transaction
 
-## Usage in Claude Desktop App 🎯
+## Usage in Claude Desktop App 
 
 Once the installation is complete, and the Claude desktop app is configured, you must completely close and re-open the Claude desktop app to see the tavily-mcp server. You should see a hammer icon in the bottom left of the app, indicating available MCP tools, you can click on the hammer icon to see more details on the available tools.
 
@@ -180,7 +245,7 @@ Deploy a mock ERC20 contract to a local anvil instance and name it "Fire Coin".
 ```
 
 
-## Acknowledgments ✨
+## Acknowledgments 
 
 - [Model Context Protocol](https://modelcontextprotocol.io) for the MCP specification
 - [Anthropic](https://anthropic.com) for Claude Desktop
