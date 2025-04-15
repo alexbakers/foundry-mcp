@@ -216,6 +216,9 @@ The server maintains a persistent Forge workspace at `~/.mcp-foundry-workspace` 
 
 ## Changelog
 
+### 1.1.1
+- _Next release: describe your new features or bugfixes here._
+
 ### 1.1.0
 - Refactored all handler registrations for clarity and maintainability
 - Enforced explicit type signatures for all resource/tool handlers

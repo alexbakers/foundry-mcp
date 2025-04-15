@@ -14,7 +14,7 @@ const execAsync = promisify(exec);
 
 const server = new McpServer({
   name: "Foundry MCP Server",
-  version: "1.1.0"
+  version: "1.1.1"
 }, {
   instructions: `
 This server provides tools for Solidity developers using the Foundry toolkit:
