@@ -214,6 +214,14 @@ The server maintains a persistent Forge workspace at `~/.mcp-foundry-workspace` 
 - `contract_size`: Get the bytecode size of a deployed contract
 - `estimate_gas`: Estimate the gas cost of a transaction
 
+## Changelog
+
+### 1.1.0
+- Refactored all handler registrations for clarity and maintainability
+- Enforced explicit type signatures for all resource/tool handlers
+- Improved error handling and code comments
+- Prepared for production deployment (NPM/Docker)
+
 ## Usage in Claude Desktop App 
 
 Once the installation is complete, and the Claude desktop app is configured, you must completely close and re-open the Claude desktop app to see the tavily-mcp server. You should see a hammer icon in the bottom left of the app, indicating available MCP tools, you can click on the hammer icon to see more details on the available tools.

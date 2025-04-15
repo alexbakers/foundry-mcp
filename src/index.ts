@@ -1,4 +1,4 @@
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate, ReadResourceTemplateCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { exec } from "child_process";
@@ -14,7 +14,7 @@ const execAsync = promisify(exec);
 
 const server = new McpServer({
   name: "Foundry MCP Server",
-  version: "0.1.0"
+  version: "1.1.0"
 }, {
   instructions: `
 This server provides tools for Solidity developers using the Foundry toolkit:
@@ -28,7 +28,7 @@ You can interact with local or remote EVM chains, deploy contracts, perform comm
 
  const FOUNDRY_WORKSPACE = path.join(os.homedir(), '.mcp-foundry-workspace');
 
- async function ensureWorkspaceInitialized() {
+ async function ensureWorkspaceInitialized(): Promise<string> {
   try {
      await fs.mkdir(FOUNDRY_WORKSPACE, { recursive: true });
     
@@ -67,7 +67,7 @@ const DEFAULT_RPC_URL = process.env.RPC_URL || "http://localhost:8545";
 const FOUNDRY_NOT_INSTALLED_ERROR = "Foundry tools are not installed. Please install Foundry: https://book.getfoundry.sh/getting-started/installation";
 
  
-async function checkFoundryInstalled() {
+async function checkFoundryInstalled(): Promise<boolean> {
   try {
     await execAsync(`${forgePath} --version`);
     return true;
@@ -78,7 +78,7 @@ async function checkFoundryInstalled() {
 }
 
  
-async function executeCommand(command) {
+async function executeCommand(command: string): Promise<{ success: boolean; message: string }> {
   try {
     const { stdout, stderr } = await execAsync(command);
     if (stderr && !stdout) {
@@ -91,7 +91,7 @@ async function executeCommand(command) {
   }
 }
  
-async function resolveRpcUrl(rpcUrl) {
+async function resolveRpcUrl(rpcUrl: string | undefined): Promise<string> {
   if (!rpcUrl) {
     return DEFAULT_RPC_URL;
   }
@@ -120,11 +120,11 @@ async function resolveRpcUrl(rpcUrl) {
 }
 
 
-async function getAnvilInfo() {
+async function getAnvilInfo(): Promise<{ running: boolean; port: string; url: string }> {
   try {
     const { stdout } = await execAsync('ps aux | grep anvil | grep -v grep');
     if (!stdout) {
-      return { running: false };
+      return { running: false, port: '', url: '' };
     }
     
     const portMatch = stdout.match(/--port\s+(\d+)/);
@@ -136,7 +136,7 @@ async function getAnvilInfo() {
       url: `http://localhost:${port}`
     };
   } catch (error) {
-    return { running: false };
+    return { running: false, port: '', url: '' };
   }
 }
 
@@ -147,47 +147,79 @@ async function getAnvilInfo() {
 // Resource: Anvil status
 server.resource(
   "anvil_status",
-  "anvil://status",
-  async (uri) => {
-    const info = await getAnvilInfo();
-    return {
+  new ResourceTemplate("anvil://status", { list: undefined }),
+  anvilStatusHandler as ReadResourceTemplateCallback
+);
+
+function anvilStatusHandler(
+  uri: URL,
+  variables: Record<string, unknown>,
+  extra: unknown,
+  req: unknown,
+  res: unknown,
+  context: unknown,
+  arg7: unknown,
+  arg8: unknown,
+  ...rest: unknown[]
+) {
+  const cb = rest[0] as (result: { contents: { type: "text"; text: string; uri: string; mimeType?: string }[] }) => void;
+  getAnvilInfo().then(anvilInfo => {
+    cb({
       contents: [{
-        uri: uri.href,
-        text: JSON.stringify(info, null, 2)
+        type: "text",
+        text: anvilInfo.running
+          ? `Anvil is running on port ${anvilInfo.port}. RPC URL: ${anvilInfo.url}`
+          : "Anvil is not running.",
+        uri: uri.toString(),
+        mimeType: "text/plain"
       }]
-    };
-  }
-)
+    });
+  });
+}
  
 // Resource: Contract source from Etherscan
 server.resource(
   "contract_source",
   new ResourceTemplate("contract://{address}/source", { list: undefined }),
-  async (uri, { address }) => {
+  async function contractSourceHandler(uri: URL, variables: Record<string, unknown>, extra: unknown): Promise<{ contents: ({ type: "text"; text: string; uri: string; mimeType?: string } | { type: "resource"; uri: string; blob: string; mimeType?: string })[] }> {
     try {
+      const address = typeof variables.address === "string" ? variables.address : String(variables.address);
       const command = `${castPath} etherscan-source ${address}`;
       const { success, message } = await executeCommand(command);
-      
       if (success) {
         return {
-          contents: [{
-            uri: uri.href,
-            text: message
-          }]
+          contents: [
+            {
+              type: "text",
+              text: message,
+              uri: uri.toString(),
+              mimeType: "text/plain"
+            },
+            {
+              type: "resource",
+              uri: uri.toString(),
+              blob: message,
+              mimeType: "text/plain"
+            }
+          ]
         };
       } else {
         return {
           contents: [{
-            uri: uri.href,
-            text: JSON.stringify({ error: "Could not retrieve contract source", details: message })
+            type: "text",
+            text: JSON.stringify({ error: "Could not retrieve contract source", details: message }),
+            uri: uri.toString(),
+            mimeType: "text/plain"
           }]
         };
       }
-    } catch (error) {
+    } catch {
       return {
         contents: [{
-          uri: uri.href,
-          text: JSON.stringify({ error: "Failed to retrieve contract source" })
+          type: "text",
+          text: JSON.stringify({ error: "Failed to retrieve contract source" }),
+          uri: uri.toString(),
+          mimeType: "text/plain"
         }]
       };
     }
@@ -210,39 +242,39 @@ server.tool(
     blockNumber: z.string().optional().describe("Block number (e.g., 'latest', 'earliest', or a number)"),
     from: z.string().optional().describe("Address to perform the call as")
   },
-  async ({ contractAddress, functionSignature, args = [], rpcUrl, blockNumber, from }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://call";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} call ${contractAddress} "${functionSignature}"`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} call ${args.contractAddress} "${args.functionSignature}"`;
     
-    if (args.length > 0) {
-      command += " " + args.join(" ");
+    if (args.args?.length && args.args.length > 0) {
+      command += " " + (args.args?.join(" ") || "");
+    }
+    
+    if (args.from) {
+      command += ` --from ${args.from}`;
     }
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (blockNumber) {
-      command += ` --block ${blockNumber}`;
-    }
-    
-    if (from) {
-      command += ` --from ${from}`;
+    if (args.blockNumber) {
+      command += ` --block ${args.blockNumber}`;
     }
     
     const result = await executeCommand(command);
     
     let formattedOutput = result.message;
     if (result.success) {
-      // Try to detect arrays and format them better
       if (formattedOutput.includes('\n') && !formattedOutput.includes('Error')) {
         formattedOutput = formattedOutput.split('\n')
           .map(line => line.trim())
@@ -255,8 +287,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Call to ${contractAddress}.${functionSignature.split('(')[0]} result:\n${formattedOutput}` 
-          : `Call failed: ${result.message}` 
+          ? `Call to ${args.contractAddress}.${args.functionSignature.split('(')[0]} result:\n${formattedOutput}` 
+          : `Call failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -278,45 +312,46 @@ server.tool(
     gasPrice: z.string().optional().describe("Gas price for the transaction (in wei)"),
     confirmations: z.number().optional().describe("Number of confirmations to wait for")
   },
-  async ({ contractAddress, functionSignature, args = [], from, value, rpcUrl, gasLimit, gasPrice, confirmations }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://send";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
     const privateKey = process.env.PRIVATE_KEY;
-    let command = `${castPath} send ${contractAddress} "${functionSignature}" --private-key ${[privateKey]}`;
+    let command = `${castPath} send ${args.contractAddress} "${args.functionSignature}" --private-key ${[privateKey]}`;
     
-    if (args.length > 0) {
-      command += " " + args.join(" ");
+    if (args.args?.length && args.args.length > 0) {
+      command += " " + (args.args?.join(" ") || "");
     }
     
-    if (from) {
-      command += ` --from ${from}`;
+    if (args.from) {
+      command += ` --from ${args.from}`;
     }
     
-    if (value) {
-      command += ` --value ${value}`;
+    if (args.value) {
+      command += ` --value ${args.value}`;
     }
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (gasLimit) {
-      command += ` --gas-limit ${gasLimit}`;
+    if (args.gasLimit) {
+      command += ` --gas-limit ${args.gasLimit}`;
     }
     
-    if (gasPrice) {
-      command += ` --gas-price ${gasPrice}`;
+    if (args.gasPrice) {
+      command += ` --gas-price ${args.gasPrice}`;
     }
     
-    if (confirmations) {
-      command += ` --confirmations ${confirmations}`;
+    if (args.confirmations) {
+      command += ` --confirmations ${args.confirmations}`;
     }
     
     const result = await executeCommand(command);
@@ -326,7 +361,9 @@ server.tool(
         type: "text", 
         text: result.success 
           ? `Transaction sent successfully:\n${result.message}` 
-          : `Transaction failed: ${result.message}` 
+          : `Transaction failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -343,39 +380,42 @@ server.tool(
     blockNumber: z.string().optional().describe("Block number (e.g., 'latest', 'earliest', or a number)"),
     formatEther: z.boolean().optional().describe("Format the balance in Ether (default: wei)")
   },
-  async ({ address, rpcUrl, blockNumber, formatEther = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://balance";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} balance ${address}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} balance ${args.address}`;
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (blockNumber) {
-      command += ` --block ${blockNumber}`;
+    if (args.blockNumber) {
+      command += ` --block ${args.blockNumber}`;
     }
     
-    if (formatEther) {
+    if (args.formatEther) {
       command += " --ether";
     }
     
     const result = await executeCommand(command);
-    const unit = formatEther ? "ETH" : "wei";
+    const unit = args.formatEther ? "ETH" : "wei";
     
     return {
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Balance of ${address}: ${result.message.trim()} ${unit}` 
-          : `Failed to get balance: ${result.message}` 
+          ? `Balance of ${args.address}: ${result.message.trim()} ${unit}` 
+          : `Failed to get balance: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -392,28 +432,29 @@ server.tool(
     confirmations: z.number().optional().describe("Number of confirmations to wait for"),
     field: z.string().optional().describe("Specific field to extract (e.g., 'blockNumber', 'status')")
   },
-  async ({ txHash, rpcUrl, confirmations, field }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://receipt";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} receipt ${txHash}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} receipt ${args.txHash}`;
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (confirmations) {
-      command += ` --confirmations ${confirmations}`;
+    if (args.confirmations) {
+      command += ` --confirmations ${args.confirmations}`;
     }
     
-    if (field) {
-      command += ` ${field}`;
+    if (args.field) {
+      command += ` ${args.field}`;
     }
     
     const result = await executeCommand(command);
@@ -422,8 +463,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Transaction receipt for ${txHash}${field ? ` (${field})` : ""}:\n${result.message}` 
-          : `Failed to get receipt: ${result.message}` 
+          ? `Transaction receipt for ${args.txHash}${args.field ? ` (${args.field})` : ""}:\n${result.message}` 
+          : `Failed to get receipt: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -440,24 +483,25 @@ server.tool(
     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)"),
     blockNumber: z.string().optional().describe("Block number (e.g., 'latest', 'earliest', or a number)")
   },
-  async ({ address, slot, rpcUrl, blockNumber }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://storage";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} storage ${address} ${slot}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} storage ${args.address} ${args.slot}`;
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (blockNumber) {
-      command += ` --block ${blockNumber}`;
+    if (args.blockNumber) {
+      command += ` --block ${args.blockNumber}`;
     }
     
     const result = await executeCommand(command);
@@ -466,8 +510,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Storage at ${address} slot ${slot}: ${result.message.trim()}` 
-          : `Failed to read storage: ${result.message}` 
+          ? `Storage at ${args.address} slot ${args.slot}: ${result.message.trim()}` 
+          : `Failed to read storage: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -485,32 +531,32 @@ server.tool(
     debug: z.boolean().optional().describe("Open the transaction in the debugger"),
     labels: z.array(z.string()).optional().describe("Label addresses in the trace (format: <address>:<label>)")
   },
-  async ({ txHash, rpcUrl, quick = false, debug = false, labels = [] }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://run";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} run ${txHash}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} run ${args.txHash}`;
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
-    if (quick) {
+    if (args.quick) {
       command += " --quick";
     }
     
-    if (debug) {
+    if (args.debug) {
       command += " --debug";
     }
     
-    // Add labels if provided
-    for (const label of labels) {
+    for (const label of args.labels || []) {
       command += ` --label ${label}`;
     }
     
@@ -520,8 +566,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Transaction trace for ${txHash}:\n${result.message}` 
-          : `Failed to run transaction: ${result.message}` 
+          ? `Trace for transaction ${args.txHash}:\n${result.message}` 
+          : `Trace failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -540,32 +588,33 @@ server.tool(
     toBlock: z.string().optional().describe("Ending block number/tag"),
     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)")
   },
-  async ({ signature, topics = [], address, fromBlock, toBlock, rpcUrl }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://logs";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} logs "${signature}"`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} logs "${args.signature}"`;
     
-    if (topics.length > 0) {
-      command += " " + topics.join(" ");
+    if (args.topics?.length && args.topics.length > 0) {
+      command += " " + (args.topics?.join(" ") || "");
     }
     
-    if (address) {
-      command += ` --address ${address}`;
+    if (args.address) {
+      command += ` --address ${args.address}`;
     }
     
-    if (fromBlock) {
-      command += ` --from-block ${fromBlock}`;
+    if (args.fromBlock) {
+      command += ` --from-block ${args.fromBlock}`;
     }
     
-    if (toBlock) {
-      command += ` --to-block ${toBlock}`;
+    if (args.toBlock) {
+      command += ` --to-block ${args.toBlock}`;
     }
     
     if (resolvedRpcUrl) {
@@ -578,8 +627,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Logs for signature "${signature}":\n${result.message}` 
-          : `Failed to get logs: ${result.message}` 
+          ? `Logs for signature "${args.signature}":\n${result.message}` 
+          : `Failed to get logs: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -594,18 +645,19 @@ server.tool(
     signature: z.string().describe("Function or event signature"),
     isEvent: z.boolean().optional().describe("Whether the signature is for an event (default: false)")
   },
-  async ({ signature, isEvent = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://sig";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const command = isEvent 
-      ? `${castPath} sig-event "${signature}"` 
-      : `${castPath} sig "${signature}"`;
+    const command = args.isEvent 
+      ? `${castPath} sig-event "${args.signature}"` 
+      : `${castPath} sig "${args.signature}"`;
     
     const result = await executeCommand(command);
     
@@ -613,8 +665,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Selector for ${isEvent ? "event" : "function"} "${signature}": ${result.message.trim()}` 
-          : `Selector generation failed: ${result.message}` 
+          ? `Selector for ${args.isEvent ? "event" : "function"} "${args.signature}": ${result.message.trim()}` 
+          : `Selector generation failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -629,18 +683,19 @@ server.tool(
     selector: z.string().describe("Function selector (0x + 4 bytes) or event topic (0x + 32 bytes)"),
     isEvent: z.boolean().optional().describe("Whether to lookup an event (default: false)")
   },
-  async ({ selector, isEvent = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://4byte";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const command = isEvent 
-      ? `${castPath} 4byte-event ${selector}` 
-      : `${castPath} 4byte ${selector}`;
+    const command = args.isEvent 
+      ? `${castPath} 4byte-event ${args.selector}` 
+      : `${castPath} 4byte ${args.selector}`;
     
     const result = await executeCommand(command);
     
@@ -648,8 +703,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Possible ${isEvent ? "event" : "function"} signatures for ${selector}:\n${result.message}` 
-          : `Lookup failed: ${result.message}` 
+          ? `Possible ${args.isEvent ? "event" : "function"} signatures for ${args.selector}:\n${result.message}` 
+          : `Lookup failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -664,17 +721,18 @@ server.tool(
     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)"),
     returnId: z.boolean().optional().describe("Return the chain ID instead of the name (default: false)")
   },
-  async ({ rpcUrl, returnId = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "cast://chain";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    const command = returnId 
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    const command = args.returnId 
       ? `${castPath} chain-id --rpc-url "${resolvedRpcUrl}"` 
       : `${castPath} chain --rpc-url "${resolvedRpcUrl}"`;
     
@@ -684,8 +742,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Chain ${returnId ? "ID" : "name"}: ${result.message.trim()}` 
-          : `Failed to get chain information: ${result.message}` 
+          ? `Chain ${args.returnId ? "ID" : "name"}: ${result.message.trim()}` 
+          : `Failed to get chain information: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -709,11 +769,12 @@ server.tool(
     mnemonic: z.string().optional().describe("BIP39 mnemonic phrase to generate accounts from"),
     silent: z.boolean().optional().describe("Suppress anvil output (default: false)")
   },
-  async ({ port = 8545, blockTime, forkUrl, forkBlockNumber, accounts, mnemonic, silent = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "anvil://start";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
@@ -724,44 +785,46 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Anvil is already running on port ${anvilInfo.port}.`
+          text: `Anvil is already running on port ${anvilInfo.port}.` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
     }
 
-    let command = `${anvilPath} --port ${port}`;
+    let command = `${anvilPath} --port ${args.port || 8545}`;
     
-    if (blockTime !== undefined) {
-      command += ` --block-time ${blockTime}`;
+    if (args.blockTime !== undefined) {
+      command += ` --block-time ${args.blockTime}`;
     }
     
-    if (forkUrl) {
-      command += ` --fork-url "${forkUrl}"`;
+    if (args.forkUrl) {
+      command += ` --fork-url "${args.forkUrl}"`;
       
-      if (forkBlockNumber !== undefined) {
-        command += ` --fork-block-number ${forkBlockNumber}`;
+      if (args.forkBlockNumber !== undefined) {
+        command += ` --fork-block-number ${args.forkBlockNumber}`;
       }
     }
     
-    if (accounts !== undefined) {
-      command += ` --accounts ${accounts}`;
+    if (args.accounts !== undefined) {
+      command += ` --accounts ${args.accounts}`;
     }
     
-    if (mnemonic) {
-      command += ` --mnemonic "${mnemonic}"`;
+    if (args.mnemonic) {
+      command += ` --mnemonic "${args.mnemonic}"`;
     }
     
     try {
       // Start anvil in the background
       const child = exec(command, (error, stdout, stderr) => {
-        if (error && !silent) {
+        if (error && !args.silent) {
           console.error(`Anvil error: ${error.message}`);
         }
-        if (stderr && !silent) {
+        if (stderr && !args.silent) {
           console.error(`Anvil stderr: ${stderr}`);
         }
-        if (stdout && !silent) {
+        if (stdout && !args.silent) {
           console.log(`Anvil stdout: ${stdout}`);
         }
       });
@@ -775,16 +838,21 @@ server.tool(
         return {
           content: [{ 
             type: "text", 
-            text: `Anvil started successfully on port ${port}. ` +
-                  `RPC URL: http://localhost:${port}\n` +
-                  `Process ID: ${child.pid}`
-          }]
+            text: `Anvil started successfully on port ${args.port || 8545}. ` +
+                  `RPC URL: http://localhost:${args.port || 8545}\n` +
+                  `Process ID: ${child.pid}` ,
+            uri: uri,
+            mimeType: "text/plain"
+          }],
+          isError: false
         };
       } else {
         return {
           content: [{ 
             type: "text", 
-            text: `Failed to start Anvil. Check system logs for details.`
+            text: `Failed to start Anvil. Check system logs for details.` ,
+            uri: uri,
+            mimeType: "text/plain"
           }],
           isError: true
         };
@@ -793,7 +861,9 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Error starting Anvil: ${error instanceof Error ? error.message : String(error)}`
+          text: `Error starting Anvil: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -806,13 +876,16 @@ server.tool(
   "anvil_stop",
   "Stop a running Anvil instance",
   {},
-  async () => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const anvilInfo = await getAnvilInfo();
+    const uri = "anvil://stop";
     if (!anvilInfo.running) {
       return {
         content: [{ 
           type: "text", 
-          text: "No Anvil instance is currently running."
+          text: "No Anvil instance is currently running." ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -834,14 +907,19 @@ server.tool(
         return {
           content: [{ 
             type: "text", 
-            text: "Anvil has been stopped successfully."
-          }]
+            text: "Anvil has been stopped successfully." ,
+            uri: uri,
+            mimeType: "text/plain"
+          }],
+          isError: false
         };
       } else {
         return {
           content: [{ 
             type: "text", 
-            text: "Failed to stop Anvil. It may still be running."
+            text: "Failed to stop Anvil. It may still be running." ,
+            uri: uri,
+            mimeType: "text/plain"
           }],
           isError: true
         };
@@ -850,7 +928,9 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Error stopping Anvil: ${error instanceof Error ? error.message : String(error)}`
+          text: `Error stopping Anvil: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -863,16 +943,20 @@ server.tool(
   "anvil_status",
   "Check if Anvil is running and get its status",
   {},
-  async () => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const anvilInfo = await getAnvilInfo();
+    const uri = "anvil://status";
     
     return {
       content: [{ 
         type: "text", 
         text: anvilInfo.running
-          ? `Anvil is running on port ${anvilInfo.port}. RPC URL: ${anvilInfo.url}`
-          : "Anvil is not currently running."
-      }]
+          ? `Anvil is running on port ${anvilInfo.port}. RPC URL: ${anvilInfo.url}` 
+          : "Anvil is not currently running." ,
+        uri: uri,
+        mimeType: "text/plain"
+      }],
+      isError: false
     };
   }
 );
@@ -888,11 +972,12 @@ server.tool(
     broadcast: z.boolean().optional().describe("Broadcast the transactions"),
     verify: z.boolean().optional().describe("Verify the contract on Etherscan (needs API key)")
   },
-  async ({ scriptPath, sig = "run()", rpcUrl, broadcast = false, verify = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "forge://script";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
@@ -901,30 +986,32 @@ server.tool(
       const workspace = await ensureWorkspaceInitialized();
       
       // Check if script exists
-      const scriptFullPath = path.join(workspace, scriptPath);
+      const scriptFullPath = path.join(workspace, args.scriptPath);
       const scriptExists = await fs.access(scriptFullPath).then(() => true).catch(() => false);
       if (!scriptExists) {
         return {
           content: [{ 
             type: "text", 
-            text: `Script does not exist at ${scriptFullPath}` 
+            text: `Script does not exist at ${scriptFullPath}` ,
+            uri: uri,
+            mimeType: "text/plain"
           }],
           isError: true
         };
       }
 
-      const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-      let command = `cd ${workspace} && ${forgePath} script ${scriptPath} --sig "${sig}"`;
+      const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+      let command = `cd ${workspace} && ${forgePath} script ${args.scriptPath} --sig "${args.sig || 'run()'}"`;
       
       if (resolvedRpcUrl) {
         command += ` --rpc-url "${resolvedRpcUrl}"`;
       }
       
-      if (broadcast) {
+      if (args.broadcast) {
         command += ` --broadcast`;
       }
       
-      if (verify) {
+      if (args.verify) {
         command += ` --verify`;
       }
       
@@ -935,7 +1022,9 @@ server.tool(
           type: "text", 
           text: result.success 
             ? `Script executed successfully:\n${result.message}` 
-            : `Script execution failed: ${result.message}` 
+            : `Script execution failed: ${result.message}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: !result.success
       };
@@ -943,7 +1032,9 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Error executing script: ${error instanceof Error ? error.message : String(error)}` 
+          text: `Error executing script: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -965,24 +1056,27 @@ server.tool(
     fromUnit: z.enum(["wei", "gwei", "ether"]).describe("Source unit"),
     toUnit: z.enum(["wei", "gwei", "ether"]).describe("Target unit")
   },
-  async ({ value, fromUnit, toUnit }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "convert://eth-units";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const command = `${castPath} to-unit ${value}${fromUnit} ${toUnit}`;
+    const command = `${castPath} to-unit ${args.value}${args.fromUnit} ${args.toUnit}`;
     const result = await executeCommand(command);
     
     return {
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `${value} ${fromUnit} = ${result.message.trim()} ${toUnit}` 
-          : `Conversion failed: ${result.message}` 
+          ? `${args.value} ${args.fromUnit} = ${result.message.trim()} ${args.toUnit}` 
+          : `Conversion failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -998,20 +1092,21 @@ server.tool(
     nonce: z.string().optional().describe("Nonce of the transaction (default: current nonce)"),
     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)")
   },
-  async ({ deployerAddress, nonce, rpcUrl }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "compute://address";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} compute-address ${deployerAddress}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} compute-address ${args.deployerAddress}`;
     
-    if (nonce) {
-      command += ` --nonce ${nonce}`;
+    if (args.nonce) {
+      command += ` --nonce ${args.nonce}`;
     }
     
     if (resolvedRpcUrl) {
@@ -1025,7 +1120,9 @@ server.tool(
         type: "text", 
         text: result.success 
           ? `Computed contract address:\n${result.message}` 
-          : `Address computation failed: ${result.message}` 
+          : `Address computation failed: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -1040,24 +1137,24 @@ server.tool(
     address: z.string().describe("Contract address"),
     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)")
   },
-  async ({ address, rpcUrl }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "contract://size";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
 
-    const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-    let command = `${castPath} codesize ${address}`;
+    const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+    let command = `${castPath} codesize ${args.address}`;
     
     if (resolvedRpcUrl) {
       command += ` --rpc-url "${resolvedRpcUrl}"`;
     }
     
     const result = await executeCommand(command);
-    
     const bytes = parseInt(result.message);
     let sizeInfo = "";
     if (!isNaN(bytes)) {
@@ -1074,8 +1171,10 @@ server.tool(
       content: [{ 
         type: "text", 
         text: result.success 
-          ? `Contract bytecode size for ${address}:${sizeInfo}` 
-          : `Failed to get contract size: ${result.message}` 
+          ? `Contract bytecode size for ${args.address}:${sizeInfo}` 
+          : `Failed to get contract size: ${result.message}` ,
+        uri: uri,
+        mimeType: "text/plain"
       }],
       isError: !result.success
     };
@@ -1092,24 +1191,25 @@ server.tool(
 //     value: z.string().optional().describe("Ether value to send with the transaction (in wei)"),
 //     rpcUrl: z.string().optional().describe("JSON-RPC URL (default: http://localhost:8545)")
 //   },
-//   async ({ to, functionSignature, args = [], value, rpcUrl }) => {
+//   async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
 //     const installed = await checkFoundryInstalled();
+//     const uri = "estimate://gas";
 //     if (!installed) {
 //       return {
-//         content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+//         content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
 //         isError: true
 //       };
 //     }
 
-//     const resolvedRpcUrl = await resolveRpcUrl(rpcUrl);
-//     let command = `${castPath} estimate ${to} "${functionSignature}"`;
+//     const resolvedRpcUrl = await resolveRpcUrl(args.rpcUrl);
+//     let command = `${castPath} estimate ${args.to} "${args.functionSignature}"`;
     
-//     if (args.length > 0) {
-//       command += " " + args.join(" ");
+//     if (args.args?.length && args.args.length > 0) {
+//       command += " " + (args.args?.join(" ") || "");
 //     }
     
-//     if (value) {
-//       command += ` --value ${value}`;
+//     if (args.value) {
+//       command += ` --value ${args.value}`;
 //     }
     
 //     if (resolvedRpcUrl) {
@@ -1143,8 +1243,10 @@ server.tool(
 //       content: [{ 
 //         type: "text", 
 //         text: result.success 
-//           ? `Estimated gas for calling ${functionSignature} on ${to}: ${gasEstimate} gas units${gasPriceInfo}` 
-//           : `Gas estimation failed: ${result.message}` 
+//           ? `Estimated gas for calling ${args.functionSignature} on ${args.to}: ${gasEstimate} gas units${gasPriceInfo}` 
+//           : `Gas estimation failed: ${result.message}` ,
+//         uri: uri,
+//         mimeType: "text/plain"
 //       }],
 //       isError: !result.success
 //     };
@@ -1160,17 +1262,19 @@ server.tool(
     content: z.string().describe("File content"),
     overwrite: z.boolean().optional().describe("Overwrite existing file (default: false)")
   },
-  async ({ filePath, content, overwrite = false }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     try {
       const workspace = await ensureWorkspaceInitialized();
-      const fullFilePath = path.join(workspace, filePath);
+      const fullFilePath = path.join(workspace, args.filePath);
       
       const fileExists = await fs.access(fullFilePath).then(() => true).catch(() => false);
-      if (fileExists && !overwrite) {
+      if (fileExists && !args.overwrite) {
         return {
           content: [{ 
             type: "text", 
-            text: `File already exists at ${fullFilePath}. Use overwrite=true to replace it.` 
+            text: `File already exists at ${fullFilePath}. Use overwrite=true to replace it.` ,
+            uri: "create://solidity-file",
+            mimeType: "text/plain"
           }],
           isError: true
         };
@@ -1178,19 +1282,24 @@ server.tool(
       
       await fs.mkdir(path.dirname(fullFilePath), { recursive: true });
       
-      await fs.writeFile(fullFilePath, content);
+      await fs.writeFile(fullFilePath, args.content);
       
       return {
         content: [{ 
           type: "text", 
-          text: `File ${fileExists ? 'updated' : 'created'} successfully at ${fullFilePath}` 
-        }]
+          text: `File ${fileExists ? 'updated' : 'created'} successfully at ${fullFilePath}` ,
+          uri: "create://solidity-file",
+          mimeType: "text/plain"
+        }],
+        isError: false
       };
     } catch (error) {
       return {
         content: [{ 
           type: "text", 
-          text: `Error managing file: ${error instanceof Error ? error.message : String(error)}` 
+          text: `Error managing file: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: "create://solidity-file",
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -1206,11 +1315,12 @@ server.tool(
     dependency: z.string().describe("GitHub repository to install (e.g., 'OpenZeppelin/openzeppelin-contracts')"),
     version: z.string().optional().describe("Version tag or branch to install (default: latest)")
   },
-  async ({ dependency, version }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     const installed = await checkFoundryInstalled();
+    const uri = "install://dependency";
     if (!installed) {
       return {
-        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR }],
+        content: [{ type: "text", text: FOUNDRY_NOT_INSTALLED_ERROR, uri, mimeType: "text/plain" }],
         isError: true
       };
     }
@@ -1218,9 +1328,9 @@ server.tool(
     try {
        const workspace = await ensureWorkspaceInitialized();
       
-       let command = `cd ${workspace} && ${forgePath} install ${dependency} --no-commit`;
-      if (version) {
-        command += ` --tag ${version}`;
+       let command = `cd ${workspace} && ${forgePath} install ${args.dependency} --no-commit`;
+      if (args.version) {
+        command += ` --tag ${args.version}`;
       }
       
       const result = await executeCommand(command);
@@ -1230,7 +1340,9 @@ server.tool(
           type: "text", 
           text: result.success 
             ? `Dependency installed successfully:\n${result.message}` 
-            : `Failed to install dependency: ${result.message}` 
+            : `Failed to install dependency: ${result.message}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: !result.success
       };
@@ -1238,7 +1350,9 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Error installing dependency: ${error instanceof Error ? error.message : String(error)}` 
+          text: `Error installing dependency: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: uri,
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -1253,30 +1367,32 @@ server.tool(
   {
     directory: z.string().optional().describe("Directory to list (e.g., 'src' or 'script'), defaults to root")
   },
-  async ({ directory = '' }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     try {
        const workspace = await ensureWorkspaceInitialized();
-      const dirPath = path.join(workspace, directory);
+      const dirPath = path.join(workspace, args.directory || '');
       
        const dirExists = await fs.access(dirPath).then(() => true).catch(() => false);
       if (!dirExists) {
         return {
           content: [{ 
             type: "text", 
-            text: `Directory '${directory}' does not exist in the workspace` 
+            text: `Directory '${args.directory}' does not exist in the workspace` ,
+            uri: "list://files",
+            mimeType: "text/plain"
           }],
           isError: true
         };
       }
       
-       async function listFiles(dir, baseDir = '') {
+       async function listFiles(dir: string, baseDir: string = ""): Promise<string[]> {
         const entries = await fs.readdir(dir, { withFileTypes: true });
-        let files = [];
+        let files: string[] = [];
         
         for (const entry of entries) {
           const relativePath = path.join(baseDir, entry.name);
           if (entry.isDirectory()) {
-            const subFiles = await listFiles(path.join(dir, entry.name), relativePath);
+            const subFiles: string[] = await listFiles(path.join(dir, entry.name), relativePath);
             files = [...files, ...subFiles];
           } else {
             files.push(relativePath);
@@ -1291,15 +1407,20 @@ server.tool(
         content: [{ 
           type: "text", 
           text: files.length > 0
-            ? `Files in ${directory || 'workspace'}:\n\n${files.join('\n')}`
-            : `No files found in ${directory || 'workspace'}`
-        }]
+            ? `Files in ${args.directory || 'workspace'}:\n\n${files.join('\n')}`
+            : `No files found in ${args.directory || 'workspace'}` ,
+          uri: "list://files",
+          mimeType: "text/plain"
+        }],
+        isError: false
       };
     } catch (error) {
       return {
         content: [{ 
           type: "text", 
-          text: `Error listing files: ${error instanceof Error ? error.message : String(error)}` 
+          text: `Error listing files: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: "list://files",
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -1314,17 +1435,19 @@ server.tool(
   {
     filePath: z.string().describe("Path to the file (e.g., 'src/MyContract.sol')")
   },
-  async ({ filePath }) => {
+  async (args, extra): Promise<{ content: { type: "text"; text: string; uri: string; mimeType?: string }[]; isError: boolean }> => {
     try {
       const workspace = await ensureWorkspaceInitialized();
-      const fullFilePath = path.join(workspace, filePath);
+      const fullFilePath = path.join(workspace, args.filePath);
       
        const fileExists = await fs.access(fullFilePath).then(() => true).catch(() => false);
       if (!fileExists) {
         return {
           content: [{ 
             type: "text", 
-            text: `File does not exist at ${fullFilePath}` 
+            text: `File does not exist at ${fullFilePath}` ,
+            uri: "read://file",
+            mimeType: "text/plain"
           }],
           isError: true
         };
@@ -1335,14 +1458,19 @@ server.tool(
       return {
         content: [{ 
           type: "text", 
-          text: `Content of ${filePath}:\n\n${content}` 
-        }]
+          text: `Content of ${args.filePath}:\n\n${content}` ,
+          uri: "read://file",
+          mimeType: "text/plain"
+        }],
+        isError: false
       };
     } catch (error) {
       return {
         content: [{ 
           type: "text", 
-          text: `Error reading file: ${error instanceof Error ? error.message : String(error)}` 
+          text: `Error reading file: ${error instanceof Error ? error.message : String(error)}` ,
+          uri: "read://file",
+          mimeType: "text/plain"
         }],
         isError: true
       };
@@ -1350,7 +1478,7 @@ server.tool(
   }
 );
 
-async function startServer() {
+async function startServer(): Promise<void> {
   const foundryInstalled = await checkFoundryInstalled();
   if (!foundryInstalled) {
     console.error("Error: Foundry is not installed");
